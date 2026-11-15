@@ -1,0 +1,22 @@
+name: windows-sync-check
+
+on:
+  push:
+    branches:
+      - ci/windows-sync-check
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Stage the exact backend source
+        shell: pwsh
+        run: Copy-Item -Path src/resilient_fs/backend.rs -Destination ci/windows-sync-harness/src/backend.rs -Force
+      - name: Root cargo check (Windows, no default features)
+        run: cargo check --no-default-features --locked
+      - name: Backend regression tests (real Windows share modes)
+        run: cargo test --manifest-path ci/windows-sync-harness/Cargo.toml -- --nocapture

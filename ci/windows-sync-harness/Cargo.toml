@@ -1,0 +1,13 @@
+[package]
+name = "windows-sync-harness"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99.0"
+publish = false
+
+[dependencies]
+zeroize = { version = "=1.9.1", features = ["derive"] }
+getrandom = "=0.4.3"
+
+[dev-dependencies]
+tempfile = "=3.27.0"
