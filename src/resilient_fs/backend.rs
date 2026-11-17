@@ -1399,6 +1399,7 @@ mod windows_tests {
         // A write open is all FSCTL_SET_REPARSE_POINT needs to turn an empty
         // pinned directory into a junction in place, so a per-operation pin
         // must keep denying it for the operation's duration.
+        use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
         let dir = tempfile::tempdir().unwrap();
         let pinned = native::parent(&dir.path().join("child")).unwrap();
