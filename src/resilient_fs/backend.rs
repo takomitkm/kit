@@ -715,11 +715,52 @@ mod native {
         // open here. The pinned ancestor walk protects the ancestors only;
         // the target itself is opened for write, so it must not also be
         // pinned read-only (hence the separate anchor-free open).
+        //
+        // The volume root ("X:\") is flushed as well when the flushed
+        // directory is not itself the volume root: measured on NTFS,
+        // FlushFileBuffers on a subdirectory handle issues the disk flush
+        // IRP but writes no metadata - the file's MFT record and the
+        // directory index stay in memory - while the volume-root flush
+        // persists that metadata, so it is what actually makes the
+        // namespace change durable (E17/E21 measurements, archived in
+        // takomitkm/leveldb docs/powercut/). Skipped for prefixes that are
+        // not drive letters (UNC shares) and for the volume root itself.
+        // It runs BEFORE the ancestor pins are taken: the pins use
+        // share_mode(1) and sharing checks are bidirectional, so the root's
+        // append-data open would collide with our own pin of the root. A
+        // third party pinning the root read-only still fails this open
+        // loudly; nothing is skipped silently.
         let absolute: PathBuf = if path.is_absolute() {
             path.components().collect()
         } else {
             std::env::current_dir()?.join(path).components().collect()
         };
+        if absolute.file_name().is_some() {
+            let mut root = std::path::PathBuf::new();
+            for part in absolute.components() {
+                if let std::path::Component::Prefix(p) = part {
+                    if let std::path::Prefix::Disk(letter) = p.kind() {
+                        root = std::path::PathBuf::from(format!("{}:\\", letter as char));
+                    }
+                }
+            }
+            if !root.as_os_str().is_empty() {
+                // FILE_APPEND_DATA, not GENERIC_WRITE: measured on NTFS, a
+                // non-elevated user cannot open the volume root for generic
+                // write (ERROR_ACCESS_DENIED) - the root's Users ACL grants
+                // append-data only - while an append-data handle flushes
+                // fine, so this works on unprivileged sessions too.
+                let vol = OpenOptions::new()
+                    .access_mode(0x0000_0004) // FILE_APPEND_DATA
+                    .custom_flags(REPARSE | BACKUP)
+                    .open(&root)?;
+                let m = vol.metadata()?;
+                if !m.is_dir() || m.file_attributes() & REPARSE_ATTRIBUTE != 0 {
+                    return Err(denied());
+                }
+                vol.sync_all()?;
+            }
+        }
         // Keep the parent pin alive through the open, metadata checks and
         // flush. Dropping it before opening would leave the ancestors
         // replaceable (OPEN_REPARSE_POINT only covers the final component).
@@ -1343,12 +1384,27 @@ mod windows_tests {
     )]
     use super::*;
 
+    // Every test here pins ancestors up to the volume root, and
+    // sync_directory opens the volume root for its flush, so two tests
+    // running in parallel collide on the root's sharing checks: the pins
+    // share read only, while the flush needs append-data access. The suite
+    // costs milliseconds, so serialize it instead of shrinking each test's
+    // pin scope.
+    static ROOT_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn root_guard() -> std::sync::MutexGuard<'static, ()> {
+        ROOT_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     // These run on a Windows GitHub Actions runner: the flush must work with
     // a live session lease holding the directory pinned, a transient
     // per-operation pin must still deny a write open, and the lease pin
     // must still reject a rename of that pinned directory.
     #[test]
     fn sync_directory_succeeds_on_a_real_directory() {
+        let _guard = root_guard();
         let dir = std::env::temp_dir().join(format!("kit-sync-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         DiskBackend.sync_directory(&dir).unwrap();
@@ -1357,12 +1413,14 @@ mod windows_tests {
 
     #[test]
     fn sync_directory_propagates_missing_directory() {
+        let _guard = root_guard();
         let missing = std::env::temp_dir().join("kit-sync-no-such-dir");
         assert!(DiskBackend.sync_directory(&missing).is_err());
     }
 
     #[test]
     fn sync_directory_coexists_with_a_held_session_lease() {
+        let _guard = root_guard();
         let dir = tempfile::tempdir().unwrap();
         let lease = DiskBackend
             .acquire_lease(&LeaseRequest {
@@ -1378,6 +1436,7 @@ mod windows_tests {
 
     #[test]
     fn pinned_directory_still_resists_rename() {
+        let _guard = root_guard();
         let dir = tempfile::tempdir().unwrap();
         let lease = DiskBackend
             .acquire_lease(&LeaseRequest {
@@ -1401,6 +1460,7 @@ mod windows_tests {
         // must keep denying it for the operation's duration.
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        let _guard = root_guard();
         let dir = tempfile::tempdir().unwrap();
         let pinned = native::parent(&dir.path().join("child")).unwrap();
         let attempted = OpenOptions::new()
@@ -1416,13 +1476,96 @@ mod windows_tests {
     fn sync_directory_rejects_a_reparse_point() {
         // The write open uses OPEN_REPARSE_POINT and the metadata check
         // rejects a reparse directory, so a junction conversion is caught
-        // fail-closed instead of being flushed through.
-        use std::os::windows::fs::symlink_dir;
+        // fail-closed instead of being flushed through. The junction is set
+        // with a real FSCTL_SET_REPARSE_POINT: mount points need no
+        // privilege (measured), unlike symlink_dir, so this runs on
+        // non-elevated sessions too.
+        use std::os::windows::fs::OpenOptionsExt;
+        let _guard = root_guard();
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("real");
         fs::create_dir(&real).unwrap();
         let link = dir.path().join("link");
-        symlink_dir(&real, &link).unwrap();
+        fs::create_dir(&link).unwrap();
+        let setter = OpenOptions::new()
+            .write(true)
+            .share_mode(3)
+            .custom_flags(0x0200_0000 | 0x0020_0000)
+            .open(&link)
+            .unwrap();
+        set_mount_point(&setter, &real).unwrap();
+        drop(setter);
         assert!(DiskBackend.sync_directory(&link).is_err());
+    }
+
+    // A real FSCTL_SET_REPARSE_POINT, not a substitute signal. Sharing
+    // cannot block conversion: the FSCTL succeeds through a
+    // FILE_WRITE_ATTRIBUTES handle, which carries no shareable access bits
+    // and is therefore invisible to sharing checks, even while a read-only
+    // pin (share_mode(1)) holds the empty directory, so sharing cannot be
+    // the guard here; the held handles are what can observe the conversion.
+    fn set_mount_point(handle: &File, target: &Path) -> io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::AsRawHandle;
+        const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+        const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn DeviceIoControl(
+                device: *mut core::ffi::c_void,
+                control: u32,
+                in_buffer: *const u8,
+                in_size: u32,
+                out_buffer: *mut u8,
+                out_size: u32,
+                returned: *mut u32,
+                overlapped: *mut core::ffi::c_void,
+            ) -> i32;
+        }
+        // REPARSE_DATA_BUFFER: tag u32, data size u16, reserved u16, then
+        // the mount-point buffer: substitute offset/length, print
+        // offset/length (u16 each), both names NUL terminated. The offsets
+        // are relative to the start of the path buffer, after the four
+        // USHORT fields; the lengths exclude the NUL.
+        let substitute: Vec<u16> = format!("\\??\\{}", target.display())
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let print: Vec<u16> = target
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let substitute_bytes = substitute.len() * 2;
+        let print_bytes = print.len() * 2;
+        let data_len = (8 + substitute_bytes + print_bytes) as u16;
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+        buf.extend_from_slice(&data_len.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&((substitute_bytes - 2) as u16).to_le_bytes());
+        buf.extend_from_slice(&(substitute_bytes as u16).to_le_bytes());
+        buf.extend_from_slice(&((print_bytes - 2) as u16).to_le_bytes());
+        for word in substitute.iter().chain(print.iter()) {
+            buf.extend_from_slice(&word.to_le_bytes());
+        }
+        let ok = unsafe {
+            DeviceIoControl(
+                handle.as_raw_handle() as *mut core::ffi::c_void,
+                FSCTL_SET_REPARSE_POINT,
+                buf.as_ptr(),
+                buf.len() as u32,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 }
