@@ -1694,4 +1694,34 @@ mod windows_tests {
         );
         let _ = fs::remove_dir(&victim);
     }
+
+    #[test]
+    fn volume_root_flush_precedes_ancestor_pins() {
+        // Regression for the flush/pin ordering in sync_directory. The
+        // ancestor pins use share_mode(1) (read only, so sharing checks
+        // reject any data-write open of the root), while the volume-root
+        // flush needs a data-write handle. If the root flush ran after the
+        // pins were taken, the flush would collide with our own pin and
+        // fail with ERROR_SHARING_VIOLATION (32). Holding a read handle on
+        // the root from outside makes that ordering observable through the
+        // public sync_directory result: this handle shares write (share=3)
+        // so it permits the early flush, but it also keeps the root pinned
+        // for the whole call.
+        use std::os::windows::fs::OpenOptionsExt;
+        let _guard = root_guard();
+        let root = std::path::PathBuf::from("C:\\");
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .custom_flags(0x0200_0000 | 0x0020_0000) // BACKUP | OPEN_REPARSE_POINT
+            .open(&root)
+            .expect("volume root must be openable read-only");
+        let dir = tempfile::tempdir().unwrap();
+        // Ok means the root was flushed before any pin took a share_mode(1)
+        // root handle; Err(32) means the ordering regressed.
+        DiskBackend
+            .sync_directory(dir.path())
+            .expect("root flush must precede the ancestor pins");
+        drop(held);
+    }
 }
