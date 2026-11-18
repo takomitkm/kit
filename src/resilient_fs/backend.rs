@@ -562,8 +562,12 @@ mod native {
         })
     }
     fn directory(path: &Path) -> io::Result<File> {
-        // Denying write/delete sharing pins every ancestor against rename and
-        // reparse-point modification until the operation has completed.
+        // Denying delete sharing pins every ancestor against rename and
+        // replacement until the operation has completed. No share mode blocks
+        // reparse-point conversion: FSCTL_SET_REPARSE_POINT succeeds through
+        // a FILE_WRITE_ATTRIBUTES handle, which carries no shareable access
+        // bits (measured on Windows), so conversion is handled by detection
+        // in check_ancestors, not by sharing.
         let f = OpenOptions::new()
             .read(true)
             .share_mode(1)
@@ -585,13 +589,14 @@ mod native {
         // write-share bit, which conflicts with share_mode(1). Sharing
         // cannot tell kit's flush open from any other process's, so the
         // lease pins share write. Delete sharing stays denied and sharing
-        // is not access, so rename protection and the ACL are unchanged. A
-        // junction conversion, if it ever happened, is still caught
-        // fail-closed by the identity and reparse checks on every later
-        // open. Transient per-operation pins keep share_mode(1): a write
-        // open is all FSCTL_SET_REPARSE_POINT needs to turn an empty pinned
-        // directory into a junction in place, so ordinary mutations never
-        // share write.
+        // is not access, so rename protection and the ACL are unchanged.
+        // No share mode blocks reparse-point conversion (a
+        // FILE_WRITE_ATTRIBUTES handle needs no shareable bits, measured),
+        // so a converted ancestor is caught fail-closed through the held
+        // handles (check_ancestors) and by the reparse check below - not by
+        // sharing. Transient per-operation pins keep share_mode(1) so
+        // ordinary mutations never expose data-write sharing on the
+        // directories they pin.
         let f = OpenOptions::new()
             .read(true)
             .share_mode(1 | 2)
@@ -641,7 +646,23 @@ mod native {
         })
     }
     impl Parent {
+        // Detects a persistent reparse-point conversion of a pinned ancestor
+        // through the already-held handle (a converted directory object keeps
+        // reporting FILE_ATTRIBUTE_REPARSE_POINT through its existing
+        // handle). This is detect-and-fail, not prevention: no share mode
+        // blocks FSCTL_SET_REPARSE_POINT, so a conversion between this check
+        // and a later path-based open is still possible, and the OS resolves
+        // path operations from the string path, not from these handles.
+        fn check_ancestors(&self) -> io::Result<()> {
+            for ancestor in &self._ancestors {
+                if ancestor.metadata()?.file_attributes() & REPARSE_ATTRIBUTE != 0 {
+                    return Err(denied());
+                }
+            }
+            Ok(())
+        }
         pub(super) fn open(&self, o: &DiskOpenOptions) -> io::Result<File> {
+            self.check_ancestors()?;
             let f = OpenOptions::new()
                 .read(o.read)
                 .write(o.write)
@@ -652,6 +673,7 @@ mod native {
                 .open(&self.path)?;
             identity(&f)?;
             self.check(&f)?;
+            self.check_ancestors()?;
             if o.truncate {
                 f.set_len(0)?;
             }
@@ -660,6 +682,7 @@ mod native {
             Ok(f)
         }
         pub(super) fn check(&self, file: &File) -> io::Result<()> {
+            self.check_ancestors()?;
             let named = OpenOptions::new()
                 .read(true)
                 .custom_flags(REPARSE)
@@ -1502,8 +1525,9 @@ mod windows_tests {
     // cannot block conversion: the FSCTL succeeds through a
     // FILE_WRITE_ATTRIBUTES handle, which carries no shareable access bits
     // and is therefore invisible to sharing checks, even while a read-only
-    // pin (share_mode(1)) holds the empty directory, so sharing cannot be
-    // the guard here; the held handles are what can observe the conversion.
+    // pin (share_mode(1)) holds the empty directory. The defense is
+    // detecting the conversion through the held handles, which
+    // check_ancestors does.
     fn set_mount_point(handle: &File, target: &Path) -> io::Result<()> {
         use std::os::windows::ffi::OsStrExt;
         use std::os::windows::io::AsRawHandle;
@@ -1567,5 +1591,107 @@ mod windows_tests {
         } else {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_write_attributes_handle_converts_a_pinned_directory() {
+        // Measured failure mode of the old assumption: while a read-only
+        // transient pin (share_mode(1)) holds an empty directory, a
+        // FILE_WRITE_ATTRIBUTES handle still converts it in place. Share
+        // modes cannot prevent conversion; only detection can respond.
+        use std::os::windows::fs::MetadataExt;
+        use std::os::windows::fs::OpenOptionsExt;
+        let _guard = root_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        let real = dir.path().join("real");
+        fs::create_dir(&victim).unwrap();
+        fs::create_dir(&real).unwrap();
+        let pinned = native::parent(&victim.join("child")).unwrap();
+        let setter = OpenOptions::new()
+            .access_mode(0x0000_0100) // FILE_WRITE_ATTRIBUTES
+            .share_mode(3)
+            .custom_flags(0x0200_0000 | 0x0020_0000) // BACKUP | OPEN_REPARSE_POINT
+            .open(&victim)
+            .unwrap();
+        set_mount_point(&setter, &real).unwrap();
+        drop(setter);
+        // The conversion persists and is observable through the path.
+        assert!(fs::symlink_metadata(&victim).unwrap().file_attributes() & 0x400 != 0);
+        // Lease creation on the converted directory is denied: the held
+        // ancestor handles report the reparse attribute (S5) and
+        // check_ancestors fails closed before any file is created.
+        let attempted = pinned.open(&DiskOpenOptions {
+            read: true,
+            write: true,
+            create_new: true,
+            private: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            attempted
+                .expect_err("converted ancestor must fail closed")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        drop(pinned);
+        let _ = fs::remove_dir(&victim); // removes the junction link itself
+    }
+
+    #[test]
+    fn lease_pins_detect_a_converted_ancestor() {
+        // The lease's own call path: hold parent_leased() pins on an empty
+        // session directory, convert that directory in place with a real
+        // FSCTL_SET_REPARSE_POINT, then require the lease creation to be
+        // denied. With the write-sharing lease pins the converting handle
+        // is an ordinary write open; what matters is that the held pins
+        // observe the conversion and the next use fails closed.
+        use std::os::windows::fs::OpenOptionsExt;
+        let _guard = root_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        let real = dir.path().join("real");
+        fs::create_dir(&victim).unwrap();
+        fs::create_dir(&real).unwrap();
+        let pinned = native::parent_leased(&victim.join("session.lock")).unwrap();
+        let setter = OpenOptions::new()
+            .write(true)
+            .share_mode(3)
+            .custom_flags(0x0200_0000 | 0x0020_0000)
+            .open(&victim)
+            .unwrap();
+        set_mount_point(&setter, &real).unwrap();
+        drop(setter);
+        // Detection on the pre-held Parent: the exact call acquire_lease
+        // makes to create the lock file. Without check_ancestors this open
+        // would follow the junction and create the lock file inside real/.
+        let attempted = pinned.open(&DiskOpenOptions {
+            read: true,
+            write: true,
+            create_new: true,
+            private: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            attempted
+                .expect_err("converted ancestor must fail closed")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        drop(pinned);
+        // And the fresh acquire_lease path: parent_leased walks the
+        // converted directory with OPEN_REPARSE_POINT and rejects the
+        // reparse metadata before any pin is taken.
+        assert!(
+            DiskBackend
+                .acquire_lease(&LeaseRequest {
+                    path: victim.join("session.lock"),
+                    scope: victim.clone(),
+                    mode: LeaseMode::CreateNew,
+                    remove_on_drop: true,
+                })
+                .is_err()
+        );
+        let _ = fs::remove_dir(&victim);
     }
 }
