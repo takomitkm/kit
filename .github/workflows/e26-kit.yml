@@ -1,0 +1,117 @@
+name: e26-kit-cost
+
+# E26d (v2): real kit, three resilient_fs backend variants, sync_directory cost.
+#   base    = speakeasy-api/kit 247e5c3 (upstream main)
+#   dironly = takomitkm/kit e02b019 (PR #345 review shape, dir flush + pins)
+#   dirroot = takomitkm/kit 669d3a4a (PR #345 head, + volume-root flush)
+#
+# The kit crate's own test target has pre-existing Unix-only gateway code
+# that does not compile on Windows (declared on PR #345), so this uses the
+# same isolation trick as the PR's windows-sync-check harness: compile the
+# branch's real src/resilient_fs/backend.rs next to a tiny bench main and
+# call Backend::sync_directory - the Windows dir-flush / root-flush site.
+
+on:
+  push:
+    branches: [bench-e26]
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: rig
+        uses: actions/checkout@v4
+        with:
+          path: rig
+
+      - name: base (upstream main)
+        uses: actions/checkout@v4
+        with:
+          repository: speakeasy-api/kit
+          ref: 247e5c3e173d94dbd81d1693d99649cffeb06907
+          path: base
+
+      - name: dironly (PR #345 review shape)
+        uses: actions/checkout@v4
+        with:
+          repository: takomitkm/kit
+          ref: e02b01927258a3e1ac0eb6ff6771f8d2f34cd5d9
+          path: dironly
+
+      - name: dirroot (PR #345 head)
+        uses: actions/checkout@v4
+        with:
+          repository: takomitkm/kit
+          ref: 669d3a4a232c8f1e8561c8fcf6dbea8a33b5c5d8
+          path: dirroot
+
+      - name: stage harnesses (real backend.rs + bench main)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path rig\e26kit-harness | Out-Null
+          foreach ($v in 'base','dironly','dirroot') {
+            New-Item -ItemType Directory -Force -Path "h-$v/src" | Out-Null
+            Copy-Item "$v\src\resilient_fs\backend.rs" "h-$v\src\backend.rs" -Force
+            Copy-Item rig\e26kit-harness\main.rs "h-$v\src\main.rs" -Force
+            @"
+[package]
+name = "e26kit-harness"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+zeroize = { version = "=1.9.1", features = ["derive"] }
+getrandom = "=0.4.3"
+"@ | Out-File -FilePath "h-$v\Cargo.toml" -Encoding utf8
+          }
+
+      - name: bench - 2 rounds x 3 variants (200 sync_directory calls each)
+        shell: pwsh
+        run: |
+          rustc --version
+          foreach ($r in 1..2) {
+            foreach ($v in 'base','dironly','dirroot') {
+              cargo run --release --manifest-path "h-$v\Cargo.toml" -- "D:\e26kit-$v-$r" 200 2>&1 |
+                Select-Object -Last 5 | Write-Host
+              Write-Host "run exit: $LASTEXITCODE"
+            }
+          }
+
+      - name: root-open access-mask sweep (which mask lets the root flush, non-admin)
+        shell: pwsh
+        run: |
+          $src = @'
+using System;
+using System.Runtime.InteropServices;
+public static class M {
+  [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+  public static extern IntPtr CreateFileW(string n, uint a, uint s, IntPtr sa, uint d, uint f, IntPtr t);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool FlushFileBuffers(IntPtr h);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  public static extern bool CloseHandle(IntPtr h);
+}
+'@
+          Add-Type -TypeDefinition $src
+          $GENERIC_WRITE = 0x40000000
+          $FILE_WRITE_DATA = 0x0002
+          $FILE_APPEND_DATA = 0x0004
+          $FILE_WRITE_ATTRIBUTES = 0x0100
+          foreach ($root in 'C:\','D:\') {
+            foreach ($m in @(@('GENERIC_WRITE',$GENERIC_WRITE), @('FILE_WRITE_DATA',$FILE_WRITE_DATA), @('FILE_APPEND_DATA',$FILE_APPEND_DATA), @('FILE_WRITE_ATTRIBUTES',$FILE_WRITE_ATTRIBUTES))) {
+              $h = [M]::CreateFileW($root, [uint32]$m[1], 7, [IntPtr]::Zero, 3, 0x02000000, [IntPtr]::Zero)
+              if ($h.ToInt64() -eq -1) {
+                Write-Host ("{0} {1,-22} open err={2}" -f $root, $m[0], [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+              } else {
+                $sw = [Diagnostics.Stopwatch]::StartNew()
+                $f = [M]::FlushFileBuffers($h)
+                $sw.Stop()
+                $fe = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                [void][M]::CloseHandle($h)
+                Write-Host ("{0} {1,-22} open ok flush={2} err={3} {4:N1} ms" -f $root, $m[0], $f, $fe, $sw.Elapsed.TotalMilliseconds)
+              }
+            }
+          }
